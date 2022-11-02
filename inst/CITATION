@@ -1,0 +1,13 @@
+citHeader("To cite gestage in publications use:")
+
+citEntry(
+  entry    = "Article",
+  author   = "AMANHI, et al.",
+  title    = "Simplified models to assess newborn gestational age in low-middle income countries: findings from a multicountry, prospective cohort study",
+  journal  = "BMJ Global Health",
+  year     = "2021",
+  url      = "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8438948/",
+  textVersion = paste(
+
+  )
+)
