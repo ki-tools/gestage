@@ -1,0 +1,259 @@
+---
+title: "Model C Fitted Values Approximation"
+author: Ryan Hafen
+date: November 1, 2022
+output:
+  html_document:
+    theme: flatly
+    highlight: kate
+---
+
+<style type="text/css">
+
+body, td {
+  font-size: 18px;
+}
+code.r{
+  font-size: 16px;
+}
+pre {
+  font-size: 16px;
+  border: none;
+}
+</style>
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 8
+)
+```
+
+<br/>
+
+This article discusses efforts to make Model C from [this paper](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8438948/) available in an R package.
+
+A challenge of sharing the models developed in this paper is that the model objects used to make predictions include the raw data, which is sensitive.
+
+For Model C, which only has gestational age at birth based on last menstrual period (LMP), `gagelmp`, and birth weight, `birthwt`, as predictors, we constructed a grid across all valid values of these variables and computed the fitted values. We can use that grid to share the model in this package without sharing the underlying data.
+
+The grid of predictor values with fitted values:
+
+```{r message=FALSE}
+library(dplyr)
+library(ggplot2)
+
+mc <- readRDS("../extdata/model_c.rds")
+mc
+```
+
+A problem with this approach is that the grid is pretty big to share with a package, 150k rows and over 3MB. We can do some work to reduce the amount of information we need to retain to reproduce the fitted values.
+
+First, a look at the data:
+
+```{r}
+distinct(mc, gagelmp)
+distinct(mc, birthwt)
+```
+
+There are 190 distinct values for `gagelmp`, incrementing by 1 day, and there are 801 distinct values for `birthwt`, incrementing by 5 grams.
+
+One idea to reduce the amount of data we need is to, for a given `gagelmp` value, use smoothing splines to approximate the fitted values across `birthwt`.
+
+Here is a visualization of a few series of fitted values for a different choices of `gagelmp` across `birthwt`.
+
+```{r}
+# look at fitted values vs. birthwt for different gagelmp
+filter(mc, gagelmp %% 2 == 0, birthwt %% 20 == 0) %>%
+ggplot(aes(birthwt, fit, group = gagelmp, color = gagelmp)) +
+  geom_line() +
+  theme_minimal() +
+  labs(y = "fitted values")
+```
+
+Let's get a better idea for how it progresses by breaking it into groups of `gagelmp`:
+
+```{r fig.height=8, fig.width=12}
+filter(mc, birthwt %% 20 == 0) %>%
+mutate(cgagelmp = cut(gagelmp, breaks = seq(160, 370, by = 30))) %>%
+ggplot(aes(birthwt, fit, group = gagelmp, color = gagelmp)) +
+  geom_line(alpha = 0.6) +
+  facet_wrap(~ cgagelmp, nrow = 1) +
+  theme_minimal()
+```
+
+There are some weird non-smooth behaviors at the upper end of `gagelmp`, in particular at 2300g and 2540g:
+
+```{r}
+filter(mc, gagelmp > 300, birthwt %% 20 == 0) %>%
+ggplot(aes(birthwt, fit, group = gagelmp, color = gagelmp)) +
+  geom_line(alpha = 0.5) +
+  geom_vline(xintercept = c(2300, 2540)) +
+  theme_minimal()
+```
+
+There are some less-noticeable non-smooth behaviors at the lower end as well:
+
+```{r}
+filter(mc, gagelmp < 200, birthwt %% 20 == 0) %>%
+ggplot(aes(birthwt, fit, group = gagelmp, color = gagelmp)) +
+  geom_line(alpha = 0.5) +
+  geom_vline(xintercept = c(3050)) +
+  theme_minimal()
+```
+
+
+```{r eval=FALSE, echo=FALSE}
+filter(mc, birthwt %% 100 == 0) %>%
+ggplot(aes(gagelmp, fit, group = birthwt, color = birthwt)) +
+  geom_line() +
+  theme_minimal()
+
+diffs <- lapply(lmps, function(x) {
+  tmp <- filter(mc, gagelmp == x) %>% arrange(birthwt)
+  tibble(
+    birthwt = head(lag(tmp$birthwt, 2), nrow(tmp) - 2),
+    ddf = diff(diff(tmp$fit)),
+    gagelmp = x
+  )
+}) %>%
+  bind_rows() %>%
+  filter(!is.na(birthwt))
+
+lmps <- unique(mc$gagelmp)
+diffs %>%
+mutate(cgagelmp = cut(gagelmp, breaks = seq(160, 370, by = 30))) %>%
+ggplot(aes(birthwt, ddf, group = gagelmp, color = gagelmp)) +
+  geom_point(alpha = 0.6) +
+  geom_vline(xintercept = c(2300, 2540, 3050)) +
+  facet_wrap(~ cgagelmp, nrow = 1) +
+  theme_minimal()
+```
+
+We can take these "problem" areas and make sure we have spline knots at and around them to help us get a better approximation.
+
+Below we try several choices for a grid of knots across `birthwt` for each choise of `gagelmp`, adding in knots for the extra problem areas.
+
+```{r fig.height=6.5}
+library(splines)
+
+get_knots <- function(df) {
+  brthwts <- c(1000:5000)
+  knots <- round(unname(quantile(brthwts, ppoints(df))))
+  knots <- sort(c(knots, 2250, 2300, 2350, 2500, 2540, 2600,
+    3000, 3050, 3100))
+  knots
+}
+
+get_fit <- function(df, dat, round_fit = FALSE) {
+  knots <- get_knots(df)
+  a <- lm(fit ~ bs(birthwt, knots = knots, degree = 3), data = dat)
+  if (round_fit)
+    return(sd(round(dat$fit) - round(fitted(a))))
+  sd(dat$fit - fitted(a))
+}
+
+df <- seq(3, 42, by = 3)
+lmps <- unique(mc$gagelmp)
+res <- lapply(lmps, function(lmp) {
+  tmp <- filter(mc, gagelmp == lmp)
+  sds <- unlist(lapply(df, function(x) {
+    get_fit(df = x, tmp)
+  }))
+  tibble(df = df, sd = sds, gagelmp = lmp)
+}) %>%
+  bind_rows()
+
+ggplot(res, aes(df, sd, group = gagelmp, color = gagelmp)) +
+  geom_line(alpha = 0.5) +
+  theme_minimal() +
+  labs(y = "Standard deviation of diff between approx and actual fitted values (in days)")
+```
+
+The plot above shows the standard deviation of the errors of our approximated vs. actual fitted values at each value of `gagelmp` and for different choices of number of "degrees of freedom" (df). It looks like around 9 knots (plus another 9 we added for the problem areas) is where things stablilize, and the error of less than 0.025 days standard deviation is quite negligible at that point.
+
+```{r eval=FALSE, echo=FALSE}
+filter(res, df == 30) %>% arrange(-sd)
+filter(res, df == 9) %>% arrange(-sd)
+# by what percentage will we have reduced our data?
+100 * (length(knots) * length(unique(mc$gagelmp))) / prod(dim(mc))
+```
+
+So these are our final knots:
+
+```{r}
+knots <- get_knots(9)
+knots
+```
+
+Applying these knots to each value of `gagelmp`, we can collect the set of coefficients and use them in the package to get the approximate estimates.
+
+```{r}
+# now get coefficients
+lmps <- unique(mc$gagelmp)
+coefs <- matrix(nrow = length(lmps), ncol = 22)
+for (ii in seq_along(lmps)) {
+  tmp <- filter(mc, gagelmp == lmps[ii])
+  mod <- lm(fit ~ bs(birthwt, knots = knots, degree = 3), data = tmp)
+  cfs <- unname(coef(mod))
+  # tibble(gagelmp = x, coefs = list(cfs))
+  coefs[ii, ] <- cfs
+}
+dim(coefs)
+```
+
+The result, `coefs`, is a 190x22 matrix, where each of the 190 rows represents `gagelmp = 161, 162, ..., 349, 350` and each column is a spline coefficient.
+
+We can now write a vectorized R function to get predictions using `coef` and `knots`, given values of `gagelmp` and `birthwt`. This function is in the package in a more robust form.
+
+
+```{r}
+method_c_predict <- function(gagelmp, birthwt) {
+  if (length(gagelmp) == 1)
+    gagelmp <- rep(gagelmp, length(birthwt))
+  if (length(birthwt) == 1)
+    birthwt <- rep(birthwt, length(gagelmp))
+  knots <- c(1270, 1703, 2135, 2250, 2300, 2350, 2500, 2540, 2568, 2600,
+    3000, 3000, 3050, 3100, 3432, 3865, 4297, 4730)
+  # coefficients matrix starts at gagelmp 161
+  cf <- coefs[gagelmp - 160, , drop = FALSE]
+  bb <- bs(birthwt, knots = knots, Boundary.knots = c(1000, 5000),
+    degree = 3, intercept = TRUE)
+  bb[, 1] <- 1
+  # diag(cf %*% t(bb))
+  colSums(t(cf) * t(bb))
+}
+```
+
+Let's test this out:
+
+```{r}
+# approximate
+method_c_predict(gagelmp = 250, birthwt = 2800)
+# actual
+filter(mc, gagelmp == 250, birthwt == 2800) %>% pull(fit)
+```
+
+Looks good.
+
+```{r}
+pred <- method_c_predict(201:250, 2800)
+fit <- filter(mc, gagelmp %in% 201:250, birthwt == 2800) %>% pull(fit)
+pred - fit
+
+bwt <- seq(3005, 3500, by = 5)
+pred <- method_c_predict(250, bwt)
+fit <- filter(mc, gagelmp == 250, birthwt %in% bwt) %>% pull(fit)
+pred - fit
+```
+
+These approximations are good. And we now can represent Model C in 33KB of storage.
+
+While in the case of this particular model, this compression of results may not have been completely necessary, there are other models that are more complicated that could benefit from this type of exercise.
+
+```{r eval=FALSE, echo=FALSE}
+attr(coefs, "knots") <- knots
+use_data(coefs)
+# 33KB
+```
